@@ -1,0 +1,381 @@
+#!/usr/bin/python
+#Watch and manage tmux windows
+
+import curses, time, shutil, threading, random, locale, sys, re, os, math
+import subprocess as sp
+from datetime import datetime
+import notify2, cProfile
+# import dbus, gobject
+locale.setlocale(locale.LC_ALL, '')
+
+FCOM             = True  # Whether to show all arguments to a command
+NLINES           = 3     # Number of lines to show
+SHOWLINES        = False # Whether to show lines for non-highlighted things
+ALWAYSKILL       = False # Whether the kill command kills even running processes
+
+USENOTIFY        = True  # Whether to use notification
+ALWAYSURGENT     = True  # Whether notifications should always be permanent
+SHOWINACTIVE     = False # Whether to show inactive commands
+KEEPFOCUS        = True  # Whether to keep focus of tman when opening new sessions
+
+TIMEOUT          = 3000  # Timeout for notifications
+IDLETHRESHOLD    = 60    # Seconds we can idle before a notification
+LONGTHRESHOLD    = 60    # Minimum command time to send a notification on completion
+
+MAXROWS          = 100   # Rows in curses pad
+MAXCOLS          = 300   # Columns in curses pad
+USEPROIFILER     = False # Whether to run a profiler
+
+HOME             = os.path.expanduser("~")         # Home directory
+LOGDIR           = HOME+"/downloads"               # Directory for writing logs
+ICONPATH         = HOME+"/pictures/icons/tmux.png" # Icon path for notifications
+
+EPOCH            = datetime.utcfromtimestamp(0)    # Epoch time for data calculations
+
+allthreads       = []
+
+finishedsessions = {}
+idlesessions     = {}
+lastcommandtime  = {}
+lastcommandname  = {}
+notifications    = {}
+
+stopped          = False
+toUpdate         = True
+highlighted      = 0
+lastUpdate       = 0
+totalapps        = 0
+
+toOpen           = False
+toKill           = False
+toForceKill      = False
+toWrite          = False
+
+outx             = 0
+outy             = 0
+rev              = 0
+
+
+class col:
+  RED=1 # Red
+  GRN=2 # Green
+  YLW=3 # Yellow
+  BLU=4 # Blue
+  MGN=5 # Magenta
+  CYN=6 # Cyan
+  WHT=7 # White
+  BLK=8 # Black
+
+def gettimestamp():
+  return datetime.utcnow().strftime("%F_%H-%M-%S")
+
+def gettime():
+  return str(int((datetime.utcnow() - EPOCH).total_seconds()))
+
+def measureTerminal():
+  global TERMCOLS, TERMROWS
+  (TERMCOLS,TERMROWS) = shutil.get_terminal_size((80, 20))
+
+def main(stdscr=""):
+  global TERMCOLS, TERMROWS, USENOTIFY
+  global pad, allthreads, stopped, highlighted
+  global toUpdate, totalapps, toKill, toOpen, toForceKill, toWrite
+
+  pad = curses.newpad(MAXROWS,MAXCOLS)
+  curses.start_color()
+  curses.use_default_colors()
+  curses.curs_set(0)
+  [curses.init_pair(i, i, -1) for i in range(0, curses.COLORS)]
+
+  #No notifications if no grphical display
+  if not 'DISPLAY' in os.environ.keys():
+    USENOTIFY = False
+  elif os.environ['DISPLAY'] == "":
+    USENOTIFY = False
+  if USENOTIFY:
+    # loop = gobject.MainLoop().run()
+    # notify2.init("tmux-manager",dbus.set_default_main_loop(loop))
+    notify2.init("tmux-manager")
+
+  if USEPROIFILER:
+    allthreads.append(threading.Thread(target = profilePoll,args=()))
+  else:
+    allthreads.append(threading.Thread(target = updatePoll,args=()))
+  pad.refresh( 0,0, 0,0,TERMROWS-1,TERMCOLS-1)
+  [t.start() for t in allthreads]
+
+  #Input loop
+  while True:
+    c = stdscr.getch()
+    if c == curses.KEY_RESIZE:
+      measureTerminal()
+    elif c == ord('x')  or c == curses.KEY_LEFT:
+      toKill = True
+    elif c == 24: #Control x
+      toForceKill = True
+    elif c == ord('o') or c == curses.KEY_RIGHT or c == 10:
+      if totalapps == 0:
+        stopped=True
+        [t.join() for t in allthreads]
+        break
+      toOpen = True
+    elif c == curses.KEY_UP:
+      highlighted -= 1
+      if highlighted < 0:
+        highlighted = totalapps
+    elif c == curses.KEY_DOWN:
+      highlighted += 1
+      if highlighted == totalapps:
+        highlighted = 0
+    elif c == ord('w'):
+      toWrite = True
+    elif c == ord('q'):
+    # elif c == 10: #ENTER
+      stopped=True
+      [t.join() for t in allthreads]
+      break
+    toUpdate = True
+
+#Call notification system
+def notify(title,body="",urgent=False):
+  global notifications
+  if not USENOTIFY: return
+
+  if title in notifications:
+    notifications[title].close()
+
+  notifications[title] = notify2.Notification(title,body,ICONPATH)
+  notifications[title].set_timeout(TIMEOUT)
+  if ALWAYSURGENT or urgent:
+    notifications[title].set_urgency(notify2.URGENCY_CRITICAL)
+  notifications[title].show()
+
+def profilePoll():
+  cProfile.run('updatePoll()',LOGDIR+"/profileresults.txt")
+
+#Callback for manually-polled updates
+def updatePoll():
+  global toUpdate, stopped, lastUpdate
+  while True:
+    if stopped: break
+    if toUpdate or (lastUpdate > 95):
+      updateStats()
+      pad.noutrefresh( 0,0, 0,0,TERMROWS-1,TERMCOLS-1)
+      curses.doupdate()
+      pad.clear()
+      toUpdate = False
+      lastUpdate = 0
+    else:
+      lastUpdate += 1
+    time.sleep(0.01)
+
+#Move curses cursor to next line
+def nextline():
+  global outx, outy
+  outx = 0
+  outy += 1
+  if outy == TERMROWS:
+    outy = 0
+
+def writeout(ss,options=0,nohighlight=False):
+  global outx, outy, pad, rev
+  if not nohighlight:
+    options += rev
+  w = ss.split(" ")
+  if outx >= TERMCOLS-2:
+    nextline()
+  for i in range(0,len(w)):
+    t = w[i]
+    if i > 0:
+      if outx >= TERMCOLS-2:
+        nextline()
+      else:
+        pad.addstr(outy,outx," ",options)
+        outx += 1
+    while len(t) > TERMCOLS-outx:
+      pad.addstr(outy,outx,t[0:TERMCOLS-outx],options)
+      t = t[TERMCOLS-outx:]
+      nextline()
+    pad.addstr(outy,outx,t,options)
+    outx += len(t)
+
+#Return string of form WWhXXmYYs
+def msformat(time):
+  if time > 60:
+    smin = (int)(time/60)
+    ssec = time-(60*smin)
+    if smin > 60:
+      shour = (int)(smin/60)
+      smin = smin-(60*shour)
+      return str(shour)+"h"+str(smin)+"m"+str(ssec)+"s"
+    return str(smin)+"m"+str(ssec)+"s"
+  return str(time)+"s"
+
+#Update screen stats
+def updateStats():
+  global pad, totalapps, highlighted, toSub, toAdd, toMute
+  global outx, outy, rev, finishedsessions, idlesessions
+  global toKill, toOpen, toForceKill, toWrite
+  global IDLETHRESHOLD
+  stats = bash([
+    'tmux', 'list-panes', '-a', '-F',
+    "#{pane_pid} #{session_name} #{pane_current_command} #{window_activity} #{session_attached}"
+    # "#{pane_pid} #{session_name} #{pane_current_command} #{window_activity} #{session_attached} #{client_activity}"
+  ])
+  if stats == "":
+    outx = 0
+    outy = 0
+    writeout("No tmux sessions!",nohighlight=True)
+    totalapps = 0
+    return
+  stats = stats.split("\n")
+  nostats = True
+  outy = 0
+  totalapps = len(stats)
+  if highlighted > totalapps-1:
+    highlighted = totalapps-1
+  buffout=[]
+  for i in range(0,len(stats)):
+    rev = curses.A_REVERSE if highlighted == i else 0
+    outx = 0
+    nostats = False
+    fields = stats[i].split(" ")
+    assert len(fields) == 5, "Length of fields is "+str(len(fields))
+    pbase = fields[1]
+    pname = fields[1]
+    pcomm = "["+fields[2]+"]"
+    phide = False if fields[4] == "1" else True
+
+    #Get TMUX shell pid
+    ppid = fields[0]
+    #Get shell child's pid
+
+    pchild=bash(["pgrep", "-P", ppid]).split("\n")
+    if len(pchild) > 0 and pchild[0] != "":
+      ppid=pchild[0]
+
+    #Get full command if it exists
+    if FCOM and os.path.exists("/proc/"+ppid+"/cmdline"):
+      pcomm = "["+rfl("/proc/"+ppid+"/cmdline").replace("\00", " ")+"]"
+    active = not (pcomm == "[bash]" or pcomm == "[/bin/bash]")
+
+    if phide: hid = "[x] "; hidcol = col.RED
+    else:     hid = "[o] "; hidcol = col.GRN
+
+    #Open / close indicator
+    curtime = gettime()
+    writeout(hid,curses.color_pair(hidcol)+curses.A_BOLD)
+
+    #Session name
+    writeout(pbase+" ",curses.color_pair(col.WHT)+curses.A_BOLD)
+
+    if not active:
+      if SHOWINACTIVE:
+        writeout(pcomm,curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
+
+      if not pbase in finishedsessions.keys():
+        finishedsessions[pbase] = 0
+      if finishedsessions[pbase] > LONGTHRESHOLD:
+        notify(pbase,
+          "<i>Command</i>: "+lastcommandname[pbase][1:-1]
+          +"\n--------------------"
+          +"\nFinished in ~"+str(finishedsessions[pbase]) + " seconds"
+        )
+
+      if finishedsessions[pbase] > 0:
+        lastcommandtime[pbase] = finishedsessions[pbase]
+      if pbase in lastcommandtime.keys() and lastcommandtime[pbase] > 0:
+        writeout("("+msformat(lastcommandtime[pbase])+" last)",curses.color_pair(col.MGN)+curses.A_BOLD,nohighlight=True)
+      finishedsessions[pbase] = 0
+    else:
+      writeout(pcomm,curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+
+      #Measure runtime
+      stime=bash(["stat", "--format=%Y", "/proc/"+ppid+"/"])
+      if stime == "":
+        continue #Process died, so move on
+      sdelta = int(curtime)-int(stime)
+
+      finishedsessions[pbase] = sdelta
+      lastcommandtime[pbase] = 0
+      lastcommandname[pbase] = pcomm
+
+      #Print current command + command runtime
+      timestring = msformat(sdelta)
+      writeout("("+timestring+")",curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
+
+      #Time since last output
+      ptime = fields[3]
+      pdelta = int(curtime) - int(ptime)
+
+      #Current command idle time
+      if pdelta > 5:
+        writeout("("+msformat(pdelta)+" idle)",curses.color_pair(col.YLW)+curses.A_BOLD,nohighlight=True)
+      if pdelta > IDLETHRESHOLD:
+        if not pbase in idlesessions.keys():
+          idlesessions[pbase] = True #We were idle before we started the program
+        if not idlesessions[pbase]:
+          idlesessions[pbase] = True
+          notify(pbase,"Session idle for more than "+str(IDLETHRESHOLD)+" seconds")
+      else:
+        if pbase in notifications.keys():
+          notifications[pbase].close()
+        idlesessions[pbase] = False
+
+    if i == highlighted or SHOWLINES:
+      if toWrite:
+        toWrite = False
+        buffout=[f for f in bash(['tmux','capture-pane', '-p', '-S', '-', '-t', pname]).split("\n") if f != ""]
+        fname = LOGDIR+"/"+pbase+"-"+gettimestamp()
+        with open(fname,'w') as logfile:
+          for line in buffout:
+            logfile.write(line+"\n")
+        notify("tman","<b>"+pbase+"</b> buffer saved to "+fname,False)
+      else:
+        buffout=[f for f in bash(['tmux','capture-pane', '-p', '-t', pname]).split("\n") if f != ""]
+    nextline()
+
+    if i == highlighted:
+      if toForceKill:
+        bash(["tmux", "kill-session", "-t", pname])
+        toForceKill = False
+      if toKill:
+        if not phide:
+          bash(["tmux", "detach-client", "-s", pname])
+        elif ALWAYSKILL or not active:
+          bash(["tmux", "kill-session", "-t", pname])
+        toKill = False
+      if toOpen and phide:
+        if KEEPFOCUS:
+          wid = bash(["xdotool", "getactivewindow"])
+        bash(["xfce4-terminal", "--execute", "tmux", "attach-session", "-t",pname])
+        if KEEPFOCUS:
+          bash(["xdotool","windowfocus",wid])
+          bash(["xdotool","windowactivate",wid])
+        toOpen = False
+
+  writeout("-"*TERMCOLS,curses.color_pair(col.WHT)+curses.A_BOLD,nohighlight=True)
+  nextline()
+  for j in range(min(NLINES,len(buffout)),0,-1):
+    writeout(buffout[-j],nohighlight=True)
+    nextline()
+
+#Read first line from file
+def rfl(path):
+  with open(path,"r") as f:
+    x=f.readline()[:-1]
+  return x
+
+#Read all lines from file
+def ral(path):
+  with open(path,"r") as f:
+    x=f.readlines()
+  return x
+
+#Execute an arbitrary shell command (trims newline at the end)
+def bash(c):
+  return sp.Popen(c,stdout=sp.PIPE,stderr=sp.PIPE).communicate()[0].decode('utf-8')[:-1]
+
+if __name__ == "__main__":
+  measureTerminal()
+  curses.wrapper(main)

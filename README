@@ -1,0 +1,26 @@
+Basic display
+
+tmux lists all currently running tmux sessions line by line, according to the
+following format:
+  - an indicator for whether the session is currently detached [x] or attached
+    [o]
+  - the name of the session (in bold white)
+  - the currently running command, if any (in cyan brackets)
+  - the time the session's current command has been running (in green parentheses)
+  - the time the session's current command has been idling (i.e., not produced
+    output) (in yellow parentheses)
+  - if no command is running, the total execution time for the last command
+    (in magenta parentheses)
+Below all of the current sessions and a divider line, the currently
+highlighted session's last three nonempty lines of input are shown
+
+Basic commands
+  - up and down arrow keys scroll through highlighted items
+  - "o" and right arrow and enter key attaches a completely detached session to a
+    terminal (current only xfce4-terminal is supported)
+  - "x" and left arrow completely detaches the highlighted session, and closes a
+    detached session for which no command is currently running
+  - Control + "x" closes the highlighted session, regardless of whether it is attached or
+    running
+  - "w" writes the complete buffer of the highlighted session to a log file
+  - "q" exits tman
