@@ -16,7 +16,7 @@ ALWAYSKILL       = False # Whether the kill command kills even running processes
 USENOTIFY        = True  # Whether to use notification
 ALWAYSURGENT     = True  # Whether notifications should always be permanent
 SHOWINACTIVE     = False # Whether to show inactive commands
-KEEPFOCUS        = True  # Whether to keep focus of tman when opening new sessions
+KEEPFOCUS        = False # Whether to keep focus of tman when opening new sessions
 
 TIMEOUT          = 3000  # Timeout for notifications
 IDLETHRESHOLD    = 60    # Seconds we can idle before a notification
@@ -31,6 +31,7 @@ LOGDIR           = HOME+"/downloads"               # Directory for writing logs
 ICONPATH         = HOME+"/pictures/icons/tmux.png" # Icon path for notifications
 
 EPOCH            = datetime.utcfromtimestamp(0)    # Epoch time for data calculations
+XSERVER          = True                            # Whether the x server is available
 
 allthreads       = []
 
@@ -66,6 +67,150 @@ class col:
   WHT=7 # White
   BLK=8 # Black
 
+class PaneInfo:
+  def __init__(self,index,name,base,pid,command,activity,attached):
+    self.index = index
+    self.name = name
+    self.base = base
+    self.command = "["+command+"]"
+    self.activity = activity
+    self.attached = attached
+    self.phide = False if attached == "1" else True
+
+    #Get TMUX shell pid
+    self.pid = pid
+
+    #Get shell child's pid
+    self.child = bash(["pgrep", "-P", pid]).split("\n")
+    if len(self.child) > 0 and self.child[0] != "":
+      self.pid=self.child[0]
+
+    #Get full command if it exists
+    if FCOM and os.path.exists("/proc/"+self.pid+"/cmdline"):
+      self.command = "["+rfl("/proc/"+self.pid+"/cmdline").replace("\00", " ")+"]"
+    self.active = not (self.command == "[bash]" or self.command == "[/bin/bash]")
+
+  def printInactiveInfo(self):
+    global lastcommandtime
+    if SHOWINACTIVE:
+      writeout(self.command,curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
+
+    if not self.base in finishedsessions.keys():
+      finishedsessions[self.base] = 0
+    if finishedsessions[self.base] > LONGTHRESHOLD:
+      notify(self.base,
+        "<i>Command</i>: "+lastcommandname[self.base][1:-1]
+        +"\n--------------------"
+        +"\nFinished in ~"+str(finishedsessions[self.base]) + " seconds"
+      )
+
+    if finishedsessions[self.base] > 0:
+      lastcommandtime[self.base] = finishedsessions[self.base]
+    if self.base in lastcommandtime.keys() and lastcommandtime[self.base] > 0:
+      writeout(lastcommandname[self.base],curses.color_pair(col.MGN)+curses.A_BOLD,nohighlight=True)
+      writeout("("+msformat(lastcommandtime[self.base])+")",curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
+    finishedsessions[self.base] = 0
+
+  #returns: whether the session is currently active
+  def printActiveInfo(self):
+    global finishedsessions, lastcommandtime, lastcommandname, idlesessions, notifications
+    curtime = int(gettime())
+
+    writeout(self.command,curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+
+    #Measure runtime
+    stime=bash(["stat", "--format=%Y", "/proc/"+self.pid+"/"])
+    if stime == "":
+      return False #Process died, so move on
+    sdelta = curtime-int(stime)
+
+    finishedsessions[self.base] = sdelta
+    lastcommandtime[self.base] = 0
+    lastcommandname[self.base] = self.command
+
+    #Print current command + command runtime
+    timestring = msformat(sdelta)
+    writeout("("+timestring+")",curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
+
+    #Time since last output
+    ptime = self.activity
+    pdelta = curtime - int(ptime)
+
+    #Current command idle time
+    if pdelta > 5:
+      writeout("("+msformat(pdelta)+" idle)",curses.color_pair(col.YLW)+curses.A_BOLD,nohighlight=True)
+    if pdelta > IDLETHRESHOLD:
+      if not self.base in idlesessions.keys():
+        idlesessions[self.base] = True #We were idle before we started the program
+      if not idlesessions[self.base]:
+        idlesessions[self.base] = True
+        notify(self.base,"Session idle for more than "+str(IDLETHRESHOLD)+" seconds")
+    else:
+      if self.base in notifications.keys():
+        notifications[self.base].close()
+      idlesessions[self.base] = False
+    return True #We're still alive
+
+  #returns: whether the session is currently active
+  def printInfo(self):
+    if not self.active:
+      self.printInactiveInfo()
+      nextline()
+      return True
+    status = self.printActiveInfo()
+    nextline()
+    return status
+
+  def handleCommands(self):
+    if self.index != highlighted:
+      return
+    global toForceKill, toKill, toOpen
+    if toForceKill:
+      bash(["tmux", "kill-session", "-t", self.name])
+      toForceKill = False
+    if toKill:
+      if not self.phide:
+        bash(["tmux", "detach-client", "-s", self.name])
+      elif ALWAYSKILL or not self.active:
+        bash(["tmux", "kill-session", "-t", self.name])
+      toKill = False
+    if toOpen and self.phide:
+      bash(["xfce4-terminal", "--execute", "tmux", "attach-session", "-t",self.name])
+      if KEEPFOCUS:
+        bash(["xdotool","windowfocus",activewid])
+        bash(["xdotool","windowactivate",activewid])
+      toOpen = False
+
+  def printName(self):
+    global rev
+    #Set indicator
+    if activesessionname == self.name: hid = "[a] "; hidcol = col.GRN
+    elif self.phide:                   hid = "[x] "; hidcol = col.RED
+    else:                              hid = "[o] "; hidcol = col.YLW
+
+    #Set highlighting
+    rev = curses.A_REVERSE if highlighted == self.index else 0
+
+    #Print active / open / close indicator
+    writeout(hid,curses.color_pair(hidcol)+curses.A_BOLD)
+
+    #Print session name
+    writeout(self.base+" ",curses.color_pair(col.WHT)+curses.A_BOLD)
+
+  def updateBuffer(self):
+    global toWrite
+    if toWrite:
+      toWrite = False
+      buffout=[f for f in bash(['tmux','capture-pane', '-p', '-S', '-', '-t', self.name]).split("\n") if f != ""]
+      fname = LOGDIR+"/"+self.base+"-"+gettimestamp()
+      with open(fname,'w') as logfile:
+        for line in buffout:
+          logfile.write(line+"\n")
+      notify("tman","<b>"+self.base+"</b> buffer saved to "+fname,False)
+    else:
+      buffout=[f for f in bash(['tmux','capture-pane', '-p', '-t', self.name]).split("\n") if f != ""]
+    return buffout
+
 def gettimestamp():
   return datetime.utcnow().strftime("%F_%H-%M-%S")
 
@@ -77,7 +222,7 @@ def measureTerminal():
   (TERMCOLS,TERMROWS) = shutil.get_terminal_size((80, 20))
 
 def main(stdscr=""):
-  global TERMCOLS, TERMROWS, USENOTIFY
+  global TERMCOLS, TERMROWS, USENOTIFY, XSERVER, KEEPFOCUS
   global pad, allthreads, stopped, highlighted
   global toUpdate, totalapps, toKill, toOpen, toForceKill, toWrite
 
@@ -89,9 +234,13 @@ def main(stdscr=""):
 
   #No notifications if no grphical display
   if not 'DISPLAY' in os.environ.keys():
-    USENOTIFY = False
+    XSERVER = False
   elif os.environ['DISPLAY'] == "":
+    XSERVER = False
+  if not XSERVER:
     USENOTIFY = False
+    KEEPFOCUS = False
+
   if USENOTIFY:
     # loop = gobject.MainLoop().run()
     # notify2.init("tmux-manager",dbus.set_default_main_loop(loop))
@@ -211,155 +360,6 @@ def msformat(time):
     return str(smin)+"m"+str(ssec)+"s"
   return str(time)+"s"
 
-#Update screen stats
-def updateStats():
-  global pad, totalapps, highlighted, toSub, toAdd, toMute
-  global outx, outy, rev, finishedsessions, idlesessions
-  global toKill, toOpen, toForceKill, toWrite
-  global IDLETHRESHOLD
-  stats = bash([
-    'tmux', 'list-panes', '-a', '-F',
-    "#{pane_pid} #{session_name} #{pane_current_command} #{window_activity} #{session_attached}"
-    # "#{pane_pid} #{session_name} #{pane_current_command} #{window_activity} #{session_attached} #{client_activity}"
-  ])
-  if stats == "":
-    outx = 0
-    outy = 0
-    writeout("No tmux sessions!",nohighlight=True)
-    totalapps = 0
-    return
-  stats = stats.split("\n")
-  nostats = True
-  outy = 0
-  totalapps = len(stats)
-  if highlighted > totalapps-1:
-    highlighted = totalapps-1
-  buffout=[]
-  for i in range(0,len(stats)):
-    rev = curses.A_REVERSE if highlighted == i else 0
-    outx = 0
-    nostats = False
-    fields = stats[i].split(" ")
-    assert len(fields) == 5, "Length of fields is "+str(len(fields))
-    pbase = fields[1]
-    pname = fields[1]
-    pcomm = "["+fields[2]+"]"
-    phide = False if fields[4] == "1" else True
-
-    #Get TMUX shell pid
-    ppid = fields[0]
-    #Get shell child's pid
-
-    pchild=bash(["pgrep", "-P", ppid]).split("\n")
-    if len(pchild) > 0 and pchild[0] != "":
-      ppid=pchild[0]
-
-    #Get full command if it exists
-    if FCOM and os.path.exists("/proc/"+ppid+"/cmdline"):
-      pcomm = "["+rfl("/proc/"+ppid+"/cmdline").replace("\00", " ")+"]"
-    active = not (pcomm == "[bash]" or pcomm == "[/bin/bash]")
-
-    if phide: hid = "[x] "; hidcol = col.RED
-    else:     hid = "[o] "; hidcol = col.GRN
-
-    #Open / close indicator
-    curtime = gettime()
-    writeout(hid,curses.color_pair(hidcol)+curses.A_BOLD)
-
-    #Session name
-    writeout(pbase+" ",curses.color_pair(col.WHT)+curses.A_BOLD)
-
-    if not active:
-      if SHOWINACTIVE:
-        writeout(pcomm,curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
-
-      if not pbase in finishedsessions.keys():
-        finishedsessions[pbase] = 0
-      if finishedsessions[pbase] > LONGTHRESHOLD:
-        notify(pbase,
-          "<i>Command</i>: "+lastcommandname[pbase][1:-1]
-          +"\n--------------------"
-          +"\nFinished in ~"+str(finishedsessions[pbase]) + " seconds"
-        )
-
-      if finishedsessions[pbase] > 0:
-        lastcommandtime[pbase] = finishedsessions[pbase]
-      if pbase in lastcommandtime.keys() and lastcommandtime[pbase] > 0:
-        writeout("("+msformat(lastcommandtime[pbase])+" last)",curses.color_pair(col.MGN)+curses.A_BOLD,nohighlight=True)
-      finishedsessions[pbase] = 0
-    else:
-      writeout(pcomm,curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
-
-      #Measure runtime
-      stime=bash(["stat", "--format=%Y", "/proc/"+ppid+"/"])
-      if stime == "":
-        continue #Process died, so move on
-      sdelta = int(curtime)-int(stime)
-
-      finishedsessions[pbase] = sdelta
-      lastcommandtime[pbase] = 0
-      lastcommandname[pbase] = pcomm
-
-      #Print current command + command runtime
-      timestring = msformat(sdelta)
-      writeout("("+timestring+")",curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
-
-      #Time since last output
-      ptime = fields[3]
-      pdelta = int(curtime) - int(ptime)
-
-      #Current command idle time
-      if pdelta > 5:
-        writeout("("+msformat(pdelta)+" idle)",curses.color_pair(col.YLW)+curses.A_BOLD,nohighlight=True)
-      if pdelta > IDLETHRESHOLD:
-        if not pbase in idlesessions.keys():
-          idlesessions[pbase] = True #We were idle before we started the program
-        if not idlesessions[pbase]:
-          idlesessions[pbase] = True
-          notify(pbase,"Session idle for more than "+str(IDLETHRESHOLD)+" seconds")
-      else:
-        if pbase in notifications.keys():
-          notifications[pbase].close()
-        idlesessions[pbase] = False
-
-    if i == highlighted or SHOWLINES:
-      if toWrite:
-        toWrite = False
-        buffout=[f for f in bash(['tmux','capture-pane', '-p', '-S', '-', '-t', pname]).split("\n") if f != ""]
-        fname = LOGDIR+"/"+pbase+"-"+gettimestamp()
-        with open(fname,'w') as logfile:
-          for line in buffout:
-            logfile.write(line+"\n")
-        notify("tman","<b>"+pbase+"</b> buffer saved to "+fname,False)
-      else:
-        buffout=[f for f in bash(['tmux','capture-pane', '-p', '-t', pname]).split("\n") if f != ""]
-    nextline()
-
-    if i == highlighted:
-      if toForceKill:
-        bash(["tmux", "kill-session", "-t", pname])
-        toForceKill = False
-      if toKill:
-        if not phide:
-          bash(["tmux", "detach-client", "-s", pname])
-        elif ALWAYSKILL or not active:
-          bash(["tmux", "kill-session", "-t", pname])
-        toKill = False
-      if toOpen and phide:
-        if KEEPFOCUS:
-          wid = bash(["xdotool", "getactivewindow"])
-        bash(["xfce4-terminal", "--execute", "tmux", "attach-session", "-t",pname])
-        if KEEPFOCUS:
-          bash(["xdotool","windowfocus",wid])
-          bash(["xdotool","windowactivate",wid])
-        toOpen = False
-
-  writeout("-"*TERMCOLS,curses.color_pair(col.WHT)+curses.A_BOLD,nohighlight=True)
-  nextline()
-  for j in range(min(NLINES,len(buffout)),0,-1):
-    writeout(buffout[-j],nohighlight=True)
-    nextline()
-
 #Read first line from file
 def rfl(path):
   with open(path,"r") as f:
@@ -375,6 +375,79 @@ def ral(path):
 #Execute an arbitrary shell command (trims newline at the end)
 def bash(c):
   return sp.Popen(c,stdout=sp.PIPE,stderr=sp.PIPE).communicate()[0].decode('utf-8')[:-1]
+
+def printBuffer(buffout):
+  for j in range(min(NLINES,len(buffout)),0,-1):
+    writeout(buffout[-j],nohighlight=True)
+    nextline()
+
+def printEndBuffer(buffout):
+  writeout("-"*TERMCOLS,curses.color_pair(col.WHT)+curses.A_BOLD,nohighlight=True)
+  nextline()
+  printBuffer(buffout)
+
+def getTmuxStats():
+  global totalapps, highlighted, outx
+  #Get tmux stats
+  stats = bash([
+    'tmux', 'list-panes', '-a', '-F',
+    "#{pane_pid} #{session_name} #{pane_current_command} #{window_activity} #{session_attached}"
+  ])
+
+  #If no tmux windows, nothing to do!
+  if stats == "":
+    outx = 0
+    writeout("No tmux sessions!",nohighlight=True)
+    totalapps = 0
+    return
+
+  stats = stats.split("\n")
+  totalapps = len(stats)
+  if highlighted > totalapps-1:
+    highlighted = totalapps-1
+
+  return stats
+
+def getActiveWindowInfo():
+  global activewid, activesessionname
+  if XSERVER:
+    activewid = bash(["xdotool", "getactivewindow"])
+    activesessionname = bash(["xprop", "-id" ,activewid, "WM_NAME"]).split("]")[0].split("[")
+    activesessionname = "" if len(activesessionname) <= 1 else activesessionname[1]
+  else:
+    activewid = ""
+    activesessionname = ""
+
+def resetCursor():
+  global outx, outy
+  outx = outy = 0
+
+#Update screen stats
+def updateStats():
+  #Reset cursor
+  resetCursor()
+  #Get information about the currently active window
+  getActiveWindowInfo()
+  #Get Tmux stats
+  stats = getTmuxStats()
+  for i in range(0,totalapps):
+    #Get fields from line in Tmux stats
+    fields = stats[i].split(" ")
+    #Get pane info
+    info = PaneInfo(i,fields[1],fields[1],fields[0],fields[2],fields[3],fields[4])
+    #Print indicator and session name
+    info.printName()
+    #Print remaining info (quit if we died while printing)
+    if not info.printInfo(): continue
+    #Print buffer for each item
+    if SHOWLINES: printBuffer(info.updateBuffer())
+    #Print buffer for highlighted item
+    elif info.index == highlighted: buffout = info.updateBuffer()
+    #Handle input
+    info.handleCommands()
+  #Print buffer at the end
+  if not SHOWLINES:
+    printEndBuffer(buffout)
 
 if __name__ == "__main__":
   measureTerminal()
