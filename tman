@@ -34,6 +34,7 @@ EPOCH            = datetime.utcfromtimestamp(0)    # Epoch time for data calcula
 XSERVER          = True                            # Whether the x server is available
 
 allthreads       = []
+allpanes         = []
 
 finishedsessions = {}
 idlesessions     = {}
@@ -51,6 +52,9 @@ toOpen           = False
 toKill           = False
 toForceKill      = False
 toWrite          = False
+writeMode        = False
+renameMode       = False
+renameChar       = ''
 
 outx             = 0
 outy             = 0
@@ -87,7 +91,10 @@ class PaneInfo:
 
     #Get full command if it exists
     if FCOM and os.path.exists("/proc/"+self.pid+"/cmdline"):
-      self.command = "["+rfl("/proc/"+self.pid+"/cmdline").replace("\00", " ")+"]"
+      try:
+        self.command = "["+rfl("/proc/"+self.pid+"/cmdline").replace("\00", " ")+"]"
+      except:
+        self.command = ""
     self.active = not (self.command == "[bash]" or self.command == "[/bin/bash]")
 
   def printInactiveInfo(self):
@@ -195,7 +202,24 @@ class PaneInfo:
     writeout(hid,curses.color_pair(hidcol)+curses.A_BOLD)
 
     #Print session name
-    writeout(self.base+" ",curses.color_pair(col.WHT)+curses.A_BOLD)
+    if renameMode and highlighted == self.index:
+      writeout(self.base+" ",curses.color_pair(col.YLW)+curses.A_BOLD)
+    elif writeMode and highlighted == self.index:
+      writeout(self.base+" ",curses.color_pair(col.MGN)+curses.A_BOLD)
+    else:
+      writeout(self.base+" ",curses.color_pair(col.WHT)+curses.A_BOLD)
+
+  def renameSession(self):
+    global renameChar
+    if renameChar == "<":
+      bash(["tmux","rename","-t",self.name, self.name[:-1]])
+    elif renameChar != "":
+      bash(["tmux","rename","-t",self.name, self.name+renameChar])
+    renameChar = ""
+
+  def sendKey(self,k):
+    bash(["tmux","send","-t",self.name, chr(k)])
+    pass
 
   def updateBuffer(self):
     global toWrite
@@ -225,6 +249,7 @@ def main(stdscr=""):
   global TERMCOLS, TERMROWS, USENOTIFY, XSERVER, KEEPFOCUS
   global pad, allthreads, stopped, highlighted
   global toUpdate, totalapps, toKill, toOpen, toForceKill, toWrite
+  global renameMode, renameChar, writeMode
 
   pad = curses.newpad(MAXROWS,MAXCOLS)
   curses.start_color()
@@ -256,33 +281,61 @@ def main(stdscr=""):
   #Input loop
   while True:
     c = stdscr.getch()
-    if c == curses.KEY_RESIZE:
-      measureTerminal()
-    elif c == ord('x')  or c == curses.KEY_LEFT:
-      toKill = True
-    elif c == 24: #Control x
-      toForceKill = True
-    elif c == ord('o') or c == curses.KEY_RIGHT or c == 10:
-      if totalapps == 0:
+    if writeMode:
+      if c in [27]:
+        writeMode = False
+      else:
+        try:
+          allpanes[highlighted].sendKey(c)
+        except:
+          pass
+    elif renameMode:
+      if c in [10,27]:
+        renameMode = False
+      elif c == curses.KEY_LEFT:
+        renameChar = '<'
+        try:
+          allpanes[highlighted].renameSession()
+        except:
+          pass
+      elif chr(c) in "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM-":
+        renameChar = chr(c)
+        try:
+          allpanes[highlighted].renameSession()
+        except:
+          pass
+    else:
+      if c == curses.KEY_RESIZE:
+        measureTerminal()
+      elif c == ord('x')  or c == curses.KEY_LEFT:
+        toKill = True
+      elif c == 24: #Control x
+        toForceKill = True
+      elif c == ord('o') or c == curses.KEY_RIGHT or c == 10:
+        if totalapps == 0:
+          stopped=True
+          [t.join() for t in allthreads]
+          break
+        toOpen = True
+      elif c == curses.KEY_UP:
+        highlighted -= 1
+        if highlighted < 0:
+          highlighted = totalapps
+      elif c == curses.KEY_DOWN:
+        highlighted += 1
+        if highlighted == totalapps:
+          highlighted = 0
+      elif c == ord('w'):
+        toWrite = True
+      elif c == ord('r'):
+        renameMode = True
+      elif c == ord('i'):
+        writeMode = True
+      elif c == ord('q'):
+      # elif c == 10: #ENTER
         stopped=True
         [t.join() for t in allthreads]
         break
-      toOpen = True
-    elif c == curses.KEY_UP:
-      highlighted -= 1
-      if highlighted < 0:
-        highlighted = totalapps
-    elif c == curses.KEY_DOWN:
-      highlighted += 1
-      if highlighted == totalapps:
-        highlighted = 0
-    elif c == ord('w'):
-      toWrite = True
-    elif c == ord('q'):
-    # elif c == 10: #ENTER
-      stopped=True
-      [t.join() for t in allthreads]
-      break
     toUpdate = True
 
 #Call notification system
@@ -378,7 +431,12 @@ def bash(c):
 
 def printBuffer(buffout):
   for j in range(min(NLINES,len(buffout)),0,-1):
-    writeout(buffout[-j],nohighlight=True)
+    if writeMode:
+      writeout(buffout[-j],curses.A_BOLD+curses.color_pair(2),nohighlight=True)
+      if j == 1:
+        writeout("_",curses.A_BOLD+curses.A_REVERSE,nohighlight=True)
+    else:
+      writeout(buffout[-j],0,nohighlight=True)
     nextline()
 
 def printEndBuffer(buffout):
@@ -424,6 +482,8 @@ def resetCursor():
 
 #Update screen stats
 def updateStats():
+  global allpanes
+  allpanes = []
   #Reset cursor
   resetCursor()
   #Get information about the currently active window
@@ -435,6 +495,8 @@ def updateStats():
     fields = stats[i].split(" ")
     #Get pane info
     info = PaneInfo(i,fields[1],fields[1],fields[0],fields[2],fields[3],fields[4])
+    #Append to list of panes
+    allpanes.append(info)
     #Print indicator and session name
     info.printName()
     #Print remaining info (quit if we died while printing)
@@ -447,7 +509,10 @@ def updateStats():
     info.handleCommands()
   #Print buffer at the end
   if not SHOWLINES:
-    printEndBuffer(buffout)
+    try:
+      printEndBuffer(buffout)
+    except UnboundLocalError:
+      pass
 
 if __name__ == "__main__":
   measureTerminal()
