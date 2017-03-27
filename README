@@ -24,3 +24,7 @@ Basic commands
     running
   - "w" writes the complete buffer of the highlighted session to a log file
   - "q" exits tman
+  - "i" enters insert command mode to send text directly to tmux sessions
+    (escape key to exit, left arrow to backspace)
+  - "r" enters rename mode to rename a session (escape key to exit, left arrow
+    to backspace)
