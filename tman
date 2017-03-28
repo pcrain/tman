@@ -8,12 +8,14 @@ import notify2, cProfile
 # import dbus, gobject
 locale.setlocale(locale.LC_ALL, '')
 
-FCOM             = True  # Whether to show all arguments to a command
+FCOM             = False  # Whether to show all arguments to a command
+TCOM             = False  # Whether to show command from tmux (may be different than /proc command
+SHOWCHILD        = False  # Whether to show most specific currently executing command
 NLINES           = 3     # Number of lines to show
 SHOWLINES        = False # Whether to show lines for non-highlighted things
 ALWAYSKILL       = False # Whether the kill command kills even running processes
 
-USENOTIFY        = True  # Whether to use notification
+USENOTIFY        = False  # Whether to use notification
 ALWAYSURGENT     = True  # Whether notifications should always be permanent
 SHOWINACTIVE     = False # Whether to show inactive commands
 KEEPFOCUS        = False # Whether to keep focus of tman when opening new sessions
@@ -77,7 +79,6 @@ class PaneInfo:
     self.index = index
     self.name = name
     self.base = base
-    self.command = "["+command+"]"
     self.activity = activity
     self.attached = attached
     self.phide = False if attached == "1" else True
@@ -86,22 +87,49 @@ class PaneInfo:
     self.pid = pid
 
     #Get shell child's pid
-    self.child = bash(["pgrep", "-P", pid]).split("\n")
-    if len(self.child) > 0 and self.child[0] != "":
-      self.pid=self.child[0]
+    self.childpid = bash(["pgrep", "-P", pid]).split("\n")
+    if len(self.childpid) > 0:
+      self.childpid=self.childpid[0]
 
     #Get full command if it exists
-    if FCOM and os.path.exists("/proc/"+self.pid+"/cmdline"):
-      try:
-        self.command = "["+rfl("/proc/"+self.pid+"/cmdline").replace("\00", " ")+"]"
-      except:
-        self.command = ""
-    self.active = not (self.command == "[bash]" or self.command == "[/bin/bash]")
+    if TCOM:
+      self.command = command
+      self.childcommand = command
+    else:
+      #Get my command
+      if os.path.exists("/proc/"+self.pid+"/cmdline"):
+        try:
+          self.command = rfl("/proc/"+self.pid+"/cmdline").replace("\00", " ")
+          # writeout(self.pid)
+          basecmd = self.command.split(" ")[0].split("/")[-1]
+          if basecmd in ["sh","bash","zsh", "ksh", "csh", "python","python2"]:
+            self.command = self.command.split(" ")[1]
+        except:
+          self.command = ""
+      if not FCOM:
+        self.command = self.command.split(" ")[0].split("/")[-1]
+      #Get child command if we need it (or if base command is a shell)
+      if (SHOWCHILD or self.command == "") and self.childpid != "":
+        if os.path.exists("/proc/"+self.childpid+"/cmdline"):
+          try:
+            self.childcommand = rfl("/proc/"+self.childpid+"/cmdline").replace("\00", " ")
+            # writeout(self.pid)
+            basecmd = self.childcommand.split(" ")[0].split("/")[-1]
+            if basecmd in ["sh","bash","zsh", "ksh", "csh", "python","python2"]:
+              self.childcommand = self.childcommand.split(" ")[1]
+          except:
+            self.childcommand = ""
+        if not FCOM:
+          self.childcommand = self.childcommand.split(" ")[0].split("/")[-1]
+      else:
+        self.childcommand = self.command
+
+    self.active = not (self.childcommand in ["", "bash", "/bin/bash"])
 
   def printInactiveInfo(self):
     global lastcommandtime
     if SHOWINACTIVE:
-      writeout(self.command,curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
+      writeout("["+self.command+"]",curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
 
     if not self.base in finishedsessions.keys():
       finishedsessions[self.base] = 0
@@ -124,7 +152,13 @@ class PaneInfo:
     global finishedsessions, lastcommandtime, lastcommandname, idlesessions, notifications
     curtime = int(gettime())
 
-    writeout(self.command,curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+    if self.command != "":
+      writeout("["+self.command+"]",curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+    if self.childcommand != self.command:
+      if self.command == "":
+        writeout("["+self.childcommand+"]",curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+      else:
+        writeout("["+self.childcommand+"]",curses.color_pair(col.BLU)+curses.A_BOLD,nohighlight=True)
 
     #Measure runtime
     stime=bash(["stat", "--format=%Y", "/proc/"+self.pid+"/"])
