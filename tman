@@ -62,7 +62,7 @@ toSuspend        = False
 writeMode        = False
 cmdbuffer        = []
 renameMode       = False
-renameChar       = ''
+renameBuffer     = ""
 
 outx             = 0
 outy             = 0
@@ -282,19 +282,17 @@ class PaneInfo:
     #Print session name
     name = padIfFullscreen(self.base,15)+" "
     if renameMode and highlighted == self.index:
-      writeout(name,curses.color_pair(col.YLW)+curses.A_BOLD)
+      writeout(padIfFullscreen(renameBuffer,16),curses.color_pair(col.YLW)+curses.A_BOLD)
     elif writeMode and highlighted == self.index:
       writeout(name,curses.color_pair(col.MGN)+curses.A_BOLD)
     else:
       writeout(name,curses.color_pair(col.WHT)+curses.A_BOLD)
 
   def renameSession(self):
-    global renameChar, toUpdate
-    if renameChar == "<":
-      bash(["tmux","rename","-t",self.name, self.name[:-1]])
-    elif renameChar != "":
-      bash(["tmux","rename","-t",self.name, self.name+renameChar])
-    renameChar = ""
+    global renameBuffer, toUpdate
+    if renameBuffer != "":
+      bash(["tmux","rename","-t",self.name, renameBuffer])
+    renameBuffer = ""
     toUpdate = True
 
   def sendKey(self,thekey):
@@ -336,7 +334,7 @@ def main(stdscr=""):
   global TERMCOLS, TERMROWS, USENOTIFY, XSERVER, KEEPFOCUS
   global pad, allthreads, stopped, highlighted
   global toUpdate, totalapps, toKill, toOpen, toForceKill, toWrite, toFocus, toSuspend
-  global renameMode, renameChar, writeMode, cmdbuffer
+  global renameMode, renameBuffer, writeMode, cmdbuffer
 
   pad = curses.newpad(MAXROWS,MAXCOLS)
   curses.start_color()
@@ -368,6 +366,10 @@ def main(stdscr=""):
   #Input loop
   while True:
     c = stdscr.getch()
+    try:
+      chrc = chr(c)
+    except: #In case not identifiable
+      chrc = '?'
     if writeMode:
       if c in [27]:
         writeMode = False
@@ -382,22 +384,25 @@ def main(stdscr=""):
       elif c in [127,curses.KEY_LEFT]: #Backspcae
         cmdbuffer = cmdbuffer[:-1]
       else:
-        cmdbuffer.append(chr(c))
+        try:
+          chrc = chr(c)
+          cmdbuffer.append(chrc)
+        except:
+          pass #Ignore the character if not convertible with chr()
     elif renameMode:
-      if c in [10,27]:
+      if c in [27]:
+        renameMode = False
+      elif c in [10]:
+        try:
+          allpanes[highlighted].renameSession()
+        except:
+          pass
         renameMode = False
       elif c in [127,curses.KEY_LEFT]:
-        renameChar = '<'
-        try:
-          allpanes[highlighted].renameSession()
-        except:
-          pass
-      elif chr(c) in "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM-":
-        renameChar = chr(c)
-        try:
-          allpanes[highlighted].renameSession()
-        except:
-          pass
+        if len(renameBuffer) > 0:
+          renameBuffer = renameBuffer[:-1]
+      elif chrc in "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM-":
+        renameBuffer += chrc
     else:
       if c == curses.KEY_RESIZE:
         measureTerminal()
@@ -535,11 +540,12 @@ def printBuffer(buffout):
     if writeMode:
       writeout(buffout[-j],curses.A_BOLD+curses.color_pair(2),nohighlight=True)
       if j == 1:
-        writeout(" ",curses.A_BOLD+curses.A_REVERSE,nohighlight=True)
+        writeout(" ",curses.A_BOLD,nohighlight=True)
         for char in cmdbuffer:
           if type(char) == int:
             char = chr(char)
           writeout(char,curses.A_BOLD+curses.A_REVERSE,nohighlight=True)
+        writeout(" ",curses.A_BOLD+curses.A_REVERSE,nohighlight=True)
     else:
       writeout(buffout[-j],0,nohighlight=True)
     nextline()
