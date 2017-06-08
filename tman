@@ -8,25 +8,28 @@ import notify2, cProfile
 # import dbus, gobject
 locale.setlocale(locale.LC_ALL, '')
 
-FCOM             = False  # Whether to show all arguments to a command
-TCOM             = False  # Whether to show command from tmux (may be different than /proc command
-SHOWCHILD        = False  # Whether to show most specific currently executing command
+FCOM             = False # Whether to show all arguments to a command
+TCOM             = False # Whether to show command from tmux (may be different than /proc command
+SHOWCHILD        = True  # Whether to show most specific currently executing command
 NLINES           = 3     # Number of lines to show
 SHOWLINES        = False # Whether to show lines for non-highlighted things
 ALWAYSKILL       = False # Whether the kill command kills even running processes
 
-USENOTIFY        = False  # Whether to use notification
+USENOTIFY        = False # Whether to use notification
 ALWAYSURGENT     = True  # Whether notifications should always be permanent
-SHOWINACTIVE     = False # Whether to show inactive commands
+SHOWINACTIVE     = True  # Whether to show inactive commands
 KEEPFOCUS        = False # Whether to keep focus of tman when opening new sessions
 
 TIMEOUT          = 3000  # Timeout for notifications
-IDLETHRESHOLD    = 60    # Seconds we can idle before a notification
-LONGTHRESHOLD    = 60    # Minimum command time to send a notification on completion
+IDLETHRESHOLD    = 5    # Seconds we can idle before a notification
+LONGTHRESHOLD    = 5    # Minimum command time to send a notification on completion
 
 MAXROWS          = 100   # Rows in curses pad
 MAXCOLS          = 300   # Columns in curses pad
 USEPROIFILER     = False # Whether to run a profiler
+
+FULLSCREENMODE   = True  # Whether to use a special configuration for fullscreen
+FSSIZE           = 80    # Minimum # of columns for fullscreen mode to activate
 
 HOME             = os.path.expanduser("~")         # Home directory
 LOGDIR           = HOME+"/downloads"               # Directory for writing logs
@@ -50,10 +53,12 @@ highlighted      = 0
 lastUpdate       = 0
 totalapps        = 0
 
+toFocus          = False
 toOpen           = False
 toKill           = False
 toForceKill      = False
 toWrite          = False
+toSuspend        = False
 writeMode        = False
 cmdbuffer        = []
 renameMode       = False
@@ -91,7 +96,19 @@ class PaneInfo:
     if len(self.childpid) > 0:
       self.childpid=self.childpid[0]
 
+    self.suspended = False
+    if self.childpid != self.pid:
+      fullstatus = bash(["cat", "/proc/"+self.childpid+"/status"]).split("\n")
+    else:
+      fullstatus = bash(["cat", "/proc/"+self.pid+"/status"]).split("\n")
+    for line in fullstatus:
+      if line[0:5] == "State":
+        status = line.split("\t")[1].split(" ")[0]
+        self.suspended = True if status == "T" else False
+        break
+
     #Get full command if it exists
+    self.command = ""
     if TCOM:
       self.command = command
       self.childcommand = command
@@ -102,10 +119,10 @@ class PaneInfo:
           self.command = rfl("/proc/"+self.pid+"/cmdline").replace("\00", " ")
           # writeout(self.pid)
           basecmd = self.command.split(" ")[0].split("/")[-1]
-          if basecmd in ["sh","bash","zsh", "ksh", "csh", "python","python2"]:
+          if basecmd in ["sudo","sh","bash","zsh", "ksh", "csh", "python","python2"]:
             self.command = self.command.split(" ")[1]
         except:
-          self.command = ""
+          self.command = command
       if not FCOM:
         self.command = self.command.split(" ")[0].split("/")[-1]
       #Get child command if we need it (or if base command is a shell)
@@ -115,21 +132,27 @@ class PaneInfo:
             self.childcommand = rfl("/proc/"+self.childpid+"/cmdline").replace("\00", " ")
             # writeout(self.pid)
             basecmd = self.childcommand.split(" ")[0].split("/")[-1]
-            if basecmd in ["sh","bash","zsh", "ksh", "csh", "python","python2"]:
+            if basecmd in ["sudo","sh","bash","zsh", "ksh", "csh", "python","python2"]:
               self.childcommand = self.childcommand.split(" ")[1]
+            if not FCOM:
+              self.childcommand = self.childcommand.split(" ")[0].split("/")[-1]
           except:
             self.childcommand = ""
-        if not FCOM:
-          self.childcommand = self.childcommand.split(" ")[0].split("/")[-1]
+        else:
+          self.childcommand = ""
       else:
         self.childcommand = self.command
 
     self.active = not (self.childcommand in ["", "bash", "/bin/bash"])
 
   def printInactiveInfo(self):
-    global lastcommandtime
+    global finishedsessions, lastcommandtime
     if SHOWINACTIVE:
-      writeout("["+self.command+"]",curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
+      cmdstring = padIfFullscreen("["+self.command+"]",20)
+      writeout(cmdstring,curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
+    else:
+      writeout(padIfFullscreen("",20),curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
+    # writeout(" "*20,curses.color_pair(col.RED)+curses.A_BOLD,nohighlight=True)
 
     if not self.base in finishedsessions.keys():
       finishedsessions[self.base] = 0
@@ -142,10 +165,14 @@ class PaneInfo:
 
     if finishedsessions[self.base] > 0:
       lastcommandtime[self.base] = finishedsessions[self.base]
-    if self.base in lastcommandtime.keys() and lastcommandtime[self.base] > 0:
-      writeout(lastcommandname[self.base],curses.color_pair(col.MGN)+curses.A_BOLD,nohighlight=True)
-      writeout("("+msformat(lastcommandtime[self.base])+")",curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
+    # if self.base in lastcommandtime.keys() and lastcommandtime[self.base] > 0:
+    if self.base in lastcommandtime.keys():
+      lcname = padIfFullscreen("["+lastcommandname[self.base]+"]",20)
+      writeout(lcname,curses.color_pair(col.MGN)+curses.A_BOLD,nohighlight=True)
+      lctime = padIfFullscreen("("+msformat(lastcommandtime[self.base])+")",20)
+      writeout(lctime,curses.color_pair(col.MGN)+curses.A_BOLD,nohighlight=True)
     finishedsessions[self.base] = 0
+    return True
 
   #returns: whether the session is currently active
   def printActiveInfo(self):
@@ -153,26 +180,34 @@ class PaneInfo:
     curtime = int(gettime())
 
     if self.command != "":
-      writeout("["+self.command+"]",curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+      cmdstring = padIfFullscreen("["+self.command+"]",20)
+      writeout(cmdstring,curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
     if self.childcommand != self.command:
+      ccmdstring = padIfFullscreen("["+self.childcommand+"]",20)
       if self.command == "":
-        writeout("["+self.childcommand+"]",curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+        writeout(ccmdstring,curses.color_pair(col.CYN)+curses.A_BOLD,nohighlight=True)
+        writeout(padIfFullscreen("",20),curses.color_pair(col.BLU)+curses.A_BOLD,nohighlight=True)
       else:
-        writeout("["+self.childcommand+"]",curses.color_pair(col.BLU)+curses.A_BOLD,nohighlight=True)
+        writeout(ccmdstring,curses.color_pair(col.BLU)+curses.A_BOLD,nohighlight=True)
+    else:
+      writeout(padIfFullscreen("",20),curses.color_pair(col.BLU)+curses.A_BOLD,nohighlight=True)
 
     #Measure runtime
-    stime=bash(["stat", "--format=%Y", "/proc/"+self.pid+"/"])
-    if stime == "":
+    stimea=bash(["stat", "--format=%Y", "/proc/"+self.pid+"/"])
+    stimeb=bash(["stat", "--format=%Y", "/proc/"+self.childpid+"/"])
+    if stimea == "" or stimeb == "":
       return False #Process died, so move on
-    sdelta = curtime-int(stime)
+    stime = max(int(stimea),int(stimeb))
+    sdelta = curtime-stime
 
     finishedsessions[self.base] = sdelta
     lastcommandtime[self.base] = 0
-    lastcommandname[self.base] = self.command
+    lastcommandname[self.base] = self.childcommand
 
     #Print current command + command runtime
     timestring = msformat(sdelta)
-    writeout("("+timestring+")",curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
+    rtime = padIfFullscreen("("+timestring+")",15)
+    writeout(rtime,curses.color_pair(col.GRN)+curses.A_BOLD,nohighlight=True)
 
     #Time since last output
     ptime = self.activity
@@ -180,7 +215,8 @@ class PaneInfo:
 
     #Current command idle time
     if pdelta > 5:
-      writeout("("+msformat(pdelta)+" idle)",curses.color_pair(col.YLW)+curses.A_BOLD,nohighlight=True)
+      itime = padIfFullscreen("("+msformat(pdelta)+" idle)",15)
+      writeout(itime,curses.color_pair(col.YLW)+curses.A_BOLD,nohighlight=True)
     if pdelta > IDLETHRESHOLD:
       if not self.base in idlesessions.keys():
         idlesessions[self.base] = True #We were idle before we started the program
@@ -193,20 +229,19 @@ class PaneInfo:
       idlesessions[self.base] = False
     return True #We're still alive
 
-  #returns: whether the session is currently active
+  #returns: whether the session is currently alive
   def printInfo(self):
     if not self.active:
-      self.printInactiveInfo()
-      nextline()
-      return True
-    status = self.printActiveInfo()
+      status = self.printInactiveInfo()
+    else:
+      status = self.printActiveInfo()
     nextline()
     return status
 
   def handleCommands(self):
     if self.index != highlighted:
       return
-    global toForceKill, toKill, toOpen
+    global toForceKill, toKill, toOpen, toSuspend
     if toForceKill:
       bash(["tmux", "kill-session", "-t", self.name])
       toForceKill = False
@@ -218,17 +253,25 @@ class PaneInfo:
       toKill = False
     if toOpen and self.phide:
       bash(["xfce4-terminal", "--execute", "tmux", "attach-session", "-t",self.name])
-      if KEEPFOCUS:
+      if not toFocus:
         bash(["xdotool","windowfocus",activewid])
         bash(["xdotool","windowactivate",activewid])
       toOpen = False
+    if toSuspend:
+      if self.suspended:
+        bash(["kill","-CONT",self.childpid])
+        bash(["tmux","send","-t",self.name,"fg","enter"])
+      else:
+        bash(["kill","-TSTP",self.childpid])
+      toSuspend = False
 
   def printName(self):
     global rev
     #Set indicator
-    if activesessionname == self.name: hid = "[a] "; hidcol = col.GRN
-    elif self.phide:                   hid = "[x] "; hidcol = col.RED
-    else:                              hid = "[o] "; hidcol = col.YLW
+    if self.suspended:                   hid = "[z] "; hidcol = col.BLU
+    elif activesessionname == self.name: hid = "[a] "; hidcol = col.GRN
+    elif self.phide:                     hid = "[x] "; hidcol = col.RED
+    else:                                hid = "[o] "; hidcol = col.YLW
 
     #Set highlighting
     rev = curses.A_REVERSE if highlighted == self.index else 0
@@ -237,12 +280,13 @@ class PaneInfo:
     writeout(hid,curses.color_pair(hidcol)+curses.A_BOLD)
 
     #Print session name
+    name = padIfFullscreen(self.base,15)+" "
     if renameMode and highlighted == self.index:
-      writeout(self.base+" ",curses.color_pair(col.YLW)+curses.A_BOLD)
+      writeout(name,curses.color_pair(col.YLW)+curses.A_BOLD)
     elif writeMode and highlighted == self.index:
-      writeout(self.base+" ",curses.color_pair(col.MGN)+curses.A_BOLD)
+      writeout(name,curses.color_pair(col.MGN)+curses.A_BOLD)
     else:
-      writeout(self.base+" ",curses.color_pair(col.WHT)+curses.A_BOLD)
+      writeout(name,curses.color_pair(col.WHT)+curses.A_BOLD)
 
   def renameSession(self):
     global renameChar, toUpdate
@@ -273,6 +317,11 @@ class PaneInfo:
       buffout=[f for f in bash(['tmux','capture-pane', '-p', '-t', self.name]).split("\n") if f != ""]
     return buffout
 
+def padIfFullscreen(string,length):
+  if FULLSCREENMODE and TERMCOLS > FSSIZE:
+    return (string+" "*length)[:length]
+  return string
+
 def gettimestamp():
   return datetime.utcnow().strftime("%F_%H-%M-%S")
 
@@ -286,7 +335,7 @@ def measureTerminal():
 def main(stdscr=""):
   global TERMCOLS, TERMROWS, USENOTIFY, XSERVER, KEEPFOCUS
   global pad, allthreads, stopped, highlighted
-  global toUpdate, totalapps, toKill, toOpen, toForceKill, toWrite
+  global toUpdate, totalapps, toKill, toOpen, toForceKill, toWrite, toFocus, toSuspend
   global renameMode, renameChar, writeMode, cmdbuffer
 
   pad = curses.newpad(MAXROWS,MAXCOLS)
@@ -362,6 +411,11 @@ def main(stdscr=""):
           [t.join() for t in allthreads]
           break
         toOpen = True
+        if c == curses.KEY_RIGHT:
+          # toFocus = False
+          toFocus = True
+        else:
+          toFocus = True
       elif c == curses.KEY_UP:
         highlighted -= 1
         if highlighted < 0:
@@ -372,6 +426,8 @@ def main(stdscr=""):
           highlighted = 0
       elif c == ord('w'):
         toWrite = True
+      elif c == ord('z'):
+        toSuspend = True
       elif c == ord('r'):
         renameMode = True
       elif c == ord('i'):
